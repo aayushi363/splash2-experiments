@@ -24,6 +24,7 @@ EXTERN_ENV
 #include "mddata.h"
 #include "split.h"
 #include "global.h"
+#include <stdio.h>
 
 void POTENG(double *POTA, double *POTR, double *PTRF, long ProcID)
 {
@@ -91,6 +92,12 @@ void POTENG(double *POTA, double *POTR, double *PTRF, long ProcID)
     } /* for mol */
 
     BARRIER(gl->PotengBar, NumProcs);
+
+    if (ProcID == 0){
+        printf("[SYNC_POINT: POTENG_INTRAMOL_BARRIER] LPOTA_partial=%.15f POTA=%.15f POTR=%.15f PTRF=%.15f\n", 
+               LPOTA, *POTA, *POTR, *PTRF);
+        fflush(stdout);
+    }
 
     /*  compute inter-molecular potential energy */
     LPOTR=0.0;

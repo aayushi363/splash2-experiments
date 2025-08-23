@@ -17,6 +17,7 @@
 /*  This file contains the declaration of the GlobalMemory
 structure and the maximum number of molecules allowed
 by the program. */
+#include <stdio.h>
 
 #define MAXLCKS	4096L
 

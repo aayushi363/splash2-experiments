@@ -279,6 +279,11 @@ void WorkStart() /* routine that each created process starts at;
     BARINCLUDE(gl->PotengBar);
 
     ProcID = ProcID % NumProcs;
+    
+    if (ProcID == 0) {
+        printf("[SYNC_POINT: WORKSTART_BEGIN] ProcID=%ld Starting MDMAIN\n", ProcID);
+        fflush(stdout);
+    }
 
     /*  POSSIBLE ENHANCEMENT:  Here's where one might bind processes
         to processors if one wanted to.
@@ -287,5 +292,7 @@ void WorkStart() /* routine that each created process starts at;
     LocalXTT = MDMAIN(NSTEP,NPRINT,NSAVE,NORD1,ProcID);
     if (ProcID == 0) {
 	    XTT = LocalXTT;
+        printf("[SYNC_POINT: WORKSTART_END] ProcID=%ld Final_XTT=%.15f\n", ProcID, XTT);
+        fflush(stdout);
     }
 }

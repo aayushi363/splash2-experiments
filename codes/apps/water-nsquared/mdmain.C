@@ -41,10 +41,18 @@ double MDMAIN(long NSTEP, long NPRINT, long NSAVE, long NORD1, long ProcID)
     INTRAF(&gl->VIR,ProcID);
 
     BARRIER(gl->start, NumProcs);
+    if (ProcID == 0) {
+        printf("[SYNC_POINT: INTRAF_BARRIER_INIT] VIR=%.15f\n", gl->VIR);
+        fflush(stdout);
+    }
 
     INTERF(ACC,&gl->VIR,ProcID);
 
     BARRIER(gl->start, NumProcs);
+    if (ProcID == 0) {
+        printf("[SYNC_POINT: INTERF_BARRIER_INIT] VIR=%.15f\n", gl->VIR);
+        fflush(stdout);
+    }
 
     /* MOLECULAR DYNAMICS LOOP OVER ALL TIME-STEPS */
 
@@ -80,6 +88,10 @@ double MDMAIN(long NSTEP, long NPRINT, long NSAVE, long NORD1, long ProcID)
         PREDIC(TLC,NORD1,ProcID);
         INTRAF(&gl->VIR,ProcID);
         BARRIER(gl->start, NumProcs);
+        if (ProcID == 0) {
+            printf("[SYNC_POINT: INTRAF_BARRIER_STEP_%ld] VIR=%.15f\n", i, gl->VIR);
+            fflush(stdout);
+        }
 
         if ((ProcID == 0) && (i >= 2)) {
             CLOCK(gl->intraend);
@@ -98,6 +110,11 @@ double MDMAIN(long NSTEP, long NPRINT, long NSAVE, long NORD1, long ProcID)
             gl->intertime += gl->interend - gl->interstart;
         }
 
+        if (ProcID == 0) {
+            printf("[SYNC_POINT: INTERF_FORCES_STEP_%ld] VIR=%.15f\n", i, gl->VIR);
+            fflush(stdout);
+        }
+
         if ((ProcID == 0) && (i >= 2)) {
             CLOCK(gl->intrastart);
         }
@@ -109,6 +126,11 @@ double MDMAIN(long NSTEP, long NPRINT, long NSAVE, long NORD1, long ProcID)
         KINETI(gl->SUM,HMAS,OMAS,ProcID);
 
         BARRIER(gl->start, NumProcs);
+        if (ProcID == 0) {
+            printf("[SYNC_POINT: KINETI_BARRIER_STEP_%ld] SUM[0]=%.15f SUM[1]=%.15f SUM[2]=%.15f\n", 
+                   i, gl->SUM[0], gl->SUM[1], gl->SUM[2]);
+            fflush(stdout);
+        }
 
         if ((ProcID == 0) && (i >= 2)) {
             CLOCK(gl->intraend);
@@ -132,6 +154,11 @@ double MDMAIN(long NSTEP, long NPRINT, long NSAVE, long NORD1, long ProcID)
             /*  call potential energy computing routine */
             POTENG(&gl->POTA,&gl->POTR,&gl->POTRF,ProcID);
             BARRIER(gl->start, NumProcs);
+            if (ProcID == 0) {
+                printf("[SYNC_POINT: POTENG_BARRIER_STEP_%ld] POTA=%.15f POTR=%.15f POTRF=%.15f\n", 
+                       i, gl->POTA, gl->POTR, gl->POTRF);
+                fflush(stdout);
+            }
 
             if ((ProcID == 0) && (i >= 2)) {
                 CLOCK(gl->interend);
@@ -157,6 +184,11 @@ double MDMAIN(long NSTEP, long NPRINT, long NSAVE, long NORD1, long ProcID)
 
         /* wait for everyone to finish time-step */
         BARRIER(gl->start, NumProcs);
+        if (ProcID == 0) {
+            printf("[SYNC_POINT: TIMESTEP_END_BARRIER_%ld] VIR=%.15f SUM_TOTAL=%.15f\n", 
+                   i, gl->VIR, gl->SUM[0]+gl->SUM[1]+gl->SUM[2]);
+            fflush(stdout);
+        }
 
         if ((ProcID == 0) && (i >= 2)) {
             CLOCK(gl->trackend);

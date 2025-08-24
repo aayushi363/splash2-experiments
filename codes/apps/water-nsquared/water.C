@@ -46,7 +46,9 @@
 MAIN_ENV
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "split.h"
+#include "cross_validation.h"
 
 /*  include files for declarations  */
 #include "parameters.h"
@@ -132,6 +134,13 @@ int main(int argc, char **argv)
     printf("Other parameters:\n\tTSTEP = %8.2e\n\tNORDER = %ld\n\tNSAVE = %ld\n",TSTEP,NORDER,NSAVE);
     printf("\tNRST = %ld\n\tNPRINT = %ld\n\tNFMC = %ld\n\tCUTOFF = %lf\n\n",NRST,NPRINT,NFMC,CUTOFF);
 
+    // Initialize cross-validation if environment variables are set
+    if (getenv("CROSS_VALIDATION_INSTANCE_ID") && getenv("CROSS_VALIDATION_NUM_INSTANCES")) {
+        printf("🔍 Cross-validation enabled for this instance\n");
+        int instance_id = atoi(getenv("CROSS_VALIDATION_INSTANCE_ID"));
+        int num_instances = atoi(getenv("CROSS_VALIDATION_NUM_INSTANCES"));
+        init_cross_validation(instance_id, num_instances);
+    }
 
     /* SET UP SCALING FACTORS AND CONSTANTS */
 
@@ -282,6 +291,7 @@ void WorkStart() /* routine that each created process starts at;
     
     if (ProcID == 0) {
         printf("[SYNC_POINT: WORKSTART_BEGIN] ProcID=%ld Starting MDMAIN\n", ProcID);
+        CROSS_VALIDATE_ASSERT(SYNC_WORKSTART_BEGIN, "ProcID=%ld", ProcID);
         fflush(stdout);
     }
 
@@ -293,6 +303,7 @@ void WorkStart() /* routine that each created process starts at;
     if (ProcID == 0) {
 	    XTT = LocalXTT;
         printf("[SYNC_POINT: WORKSTART_END] ProcID=%ld Final_XTT=%.15f\n", ProcID, XTT);
+        CROSS_VALIDATE_ASSERT(SYNC_WORKSTART_END, "XTT=%.15f", XTT);
         fflush(stdout);
     }
 }

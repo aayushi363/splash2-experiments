@@ -25,6 +25,7 @@ EXTERN_ENV
 #include "fileio.h"
 #include "split.h"
 #include "global.h"
+#include "cross_validation.h"
 
 /************************************************************************/
 
@@ -43,6 +44,7 @@ double MDMAIN(long NSTEP, long NPRINT, long NSAVE, long NORD1, long ProcID)
     BARRIER(gl->start, NumProcs);
     if (ProcID == 0) {
         printf("[SYNC_POINT: INTRAF_BARRIER_INIT] VIR=%.15f\n", gl->VIR);
+        CROSS_VALIDATE_ASSERT(SYNC_INTRAF_BARRIER_INIT, "VIR=%.15f", gl->VIR);
         fflush(stdout);
     }
 
@@ -51,6 +53,7 @@ double MDMAIN(long NSTEP, long NPRINT, long NSAVE, long NORD1, long ProcID)
     BARRIER(gl->start, NumProcs);
     if (ProcID == 0) {
         printf("[SYNC_POINT: INTERF_BARRIER_INIT] VIR=%.15f\n", gl->VIR);
+        CROSS_VALIDATE_ASSERT(SYNC_INTERF_BARRIER_INIT, "VIR=%.15f", gl->VIR);
         fflush(stdout);
     }
 
@@ -90,6 +93,9 @@ double MDMAIN(long NSTEP, long NPRINT, long NSAVE, long NORD1, long ProcID)
         BARRIER(gl->start, NumProcs);
         if (ProcID == 0) {
             printf("[SYNC_POINT: INTRAF_BARRIER_STEP_%ld] VIR=%.15f\n", i, gl->VIR);
+            if (i == 1) CROSS_VALIDATE_ASSERT(SYNC_INTRAF_BARRIER_STEP_1, "VIR=%.15f", gl->VIR);
+            else if (i == 2) CROSS_VALIDATE_ASSERT(SYNC_INTRAF_BARRIER_STEP_2, "VIR=%.15f", gl->VIR);  
+            else if (i == 3) CROSS_VALIDATE_ASSERT(SYNC_INTRAF_BARRIER_STEP_3, "VIR=%.15f", gl->VIR);
             fflush(stdout);
         }
 
@@ -112,6 +118,9 @@ double MDMAIN(long NSTEP, long NPRINT, long NSAVE, long NORD1, long ProcID)
 
         if (ProcID == 0) {
             printf("[SYNC_POINT: INTERF_FORCES_STEP_%ld] VIR=%.15f\n", i, gl->VIR);
+            if (i == 1) CROSS_VALIDATE_ASSERT(SYNC_INTERF_FORCES_STEP_1, "VIR=%.15f", gl->VIR);
+            else if (i == 2) CROSS_VALIDATE_ASSERT(SYNC_INTERF_FORCES_STEP_2, "VIR=%.15f", gl->VIR);  
+            else if (i == 3) CROSS_VALIDATE_ASSERT(SYNC_INTERF_FORCES_STEP_3, "VIR=%.15f", gl->VIR);
             fflush(stdout);
         }
 
@@ -129,6 +138,9 @@ double MDMAIN(long NSTEP, long NPRINT, long NSAVE, long NORD1, long ProcID)
         if (ProcID == 0) {
             printf("[SYNC_POINT: KINETI_BARRIER_STEP_%ld] SUM[0]=%.15f SUM[1]=%.15f SUM[2]=%.15f\n", 
                    i, gl->SUM[0], gl->SUM[1], gl->SUM[2]);
+            if (i == 1) CROSS_VALIDATE_ASSERT(SYNC_KINETI_BARRIER_STEP_1, "SUM[0]=%.15f SUM[1]=%.15f SUM[2]=%.15f", gl->SUM[0], gl->SUM[1], gl->SUM[2]);
+            else if (i == 2) CROSS_VALIDATE_ASSERT(SYNC_KINETI_BARRIER_STEP_2, "SUM[0]=%.15f SUM[1]=%.15f SUM[2]=%.15f", gl->SUM[0], gl->SUM[1], gl->SUM[2]);  
+            else if (i == 3) CROSS_VALIDATE_ASSERT(SYNC_KINETI_BARRIER_STEP_3, "SUM[0]=%.15f SUM[1]=%.15f SUM[2]=%.15f", gl->SUM[0], gl->SUM[1], gl->SUM[2]);
             fflush(stdout);
         }
 
@@ -157,6 +169,7 @@ double MDMAIN(long NSTEP, long NPRINT, long NSAVE, long NORD1, long ProcID)
             if (ProcID == 0) {
                 printf("[SYNC_POINT: POTENG_BARRIER_STEP_%ld] POTA=%.15f POTR=%.15f POTRF=%.15f\n", 
                        i, gl->POTA, gl->POTR, gl->POTRF);
+                if (i == 3) CROSS_VALIDATE_ASSERT(SYNC_POTENG_BARRIER_STEP_3, "POTA=%.15f POTR=%.15f POTRF=%.15f", gl->POTA, gl->POTR, gl->POTRF);
                 fflush(stdout);
             }
 
@@ -187,6 +200,9 @@ double MDMAIN(long NSTEP, long NPRINT, long NSAVE, long NORD1, long ProcID)
         if (ProcID == 0) {
             printf("[SYNC_POINT: TIMESTEP_END_BARRIER_%ld] VIR=%.15f SUM_TOTAL=%.15f\n", 
                    i, gl->VIR, gl->SUM[0]+gl->SUM[1]+gl->SUM[2]);
+            if (i == 1) CROSS_VALIDATE_ASSERT(SYNC_TIMESTEP_END_BARRIER_1, "VIR=%.15f SUM_TOTAL=%.15f", gl->VIR, gl->SUM[0]+gl->SUM[1]+gl->SUM[2]);
+            else if (i == 2) CROSS_VALIDATE_ASSERT(SYNC_TIMESTEP_END_BARRIER_2, "VIR=%.15f SUM_TOTAL=%.15f", gl->VIR, gl->SUM[0]+gl->SUM[1]+gl->SUM[2]);  
+            else if (i == 3) CROSS_VALIDATE_ASSERT(SYNC_TIMESTEP_END_BARRIER_3, "VIR=%.15f SUM_TOTAL=%.15f", gl->VIR, gl->SUM[0]+gl->SUM[1]+gl->SUM[2]);
             fflush(stdout);
         }
 

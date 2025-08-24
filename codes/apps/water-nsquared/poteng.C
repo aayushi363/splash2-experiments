@@ -25,6 +25,7 @@ EXTERN_ENV
 #include "split.h"
 #include "global.h"
 #include <stdio.h>
+#include "cross_validation.h"
 
 void POTENG(double *POTA, double *POTR, double *PTRF, long ProcID)
 {
@@ -96,6 +97,7 @@ void POTENG(double *POTA, double *POTR, double *PTRF, long ProcID)
     if (ProcID == 0){
         printf("[SYNC_POINT: POTENG_INTRAMOL_BARRIER] LPOTA_partial=%.15f POTA=%.15f POTR=%.15f PTRF=%.15f\n", 
                LPOTA, *POTA, *POTR, *PTRF);
+        CROSS_VALIDATE_ASSERT(SYNC_POTENG_INTRAMOL_BARRIER, "LPOTA=%.15f POTA=%.15f POTR=%.15f PTRF=%.15f", LPOTA, *POTA, *POTR, *PTRF);
         fflush(stdout);
     }
 

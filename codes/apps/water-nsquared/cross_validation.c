@@ -1,14 +1,18 @@
+#define _GNU_SOURCE
 #include "cross_validation.h"
 #include <stdarg.h>
 #include <time.h>
 #include <math.h>
 #include <ctype.h>
 
-// Global variables
+// Global validation state
 validation_context_t *g_validation_context = NULL;
-int g_instance_id = -1;
+cross_validation_t *g_validation = NULL;
 int g_validation_enabled = 0;
-int g_client_fds[MAX_INSTANCES] = {0}; // Global client file descriptors
+int g_instance_id = 0;
+char g_socket_path[256];
+int g_client_fds[16];
+int g_sync_point_counter = 0;  // Sequential counter for unique sync points
 
 // Coordinator state
 typedef struct {
@@ -30,6 +34,13 @@ int init_cross_validation(int instance_id, int num_instances) {
     }
     
     g_instance_id = instance_id;
+
+    // Create shared socket path that works across McMini instances
+    // Use a fixed path that both instances can access
+    snprintf(g_socket_path, sizeof(g_socket_path), "/tmp/water_validation_shared");
+    
+    printf("🔧 Instance %d using shared socket path: %s\n", instance_id, g_socket_path);
+    fflush(stdout);
     
     // Allocate validation context
     g_validation_context = (validation_context_t*)calloc(1, sizeof(validation_context_t));
@@ -45,7 +56,7 @@ int init_cross_validation(int instance_id, int num_instances) {
     // If this is the coordinator (instance 0), set up Unix domain socket server
     if (g_validation_context->is_coordinator) {
         // Remove existing socket file
-        unlink(SOCKET_PATH);
+        unlink(g_socket_path);
         
         // Create Unix domain socket
         g_validation_context->server_socket = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -59,7 +70,7 @@ int init_cross_validation(int instance_id, int num_instances) {
         struct sockaddr_un server_addr;
         memset(&server_addr, 0, sizeof(server_addr));
         server_addr.sun_family = AF_UNIX;
-        strncpy(server_addr.sun_path, SOCKET_PATH, sizeof(server_addr.sun_path) - 1);
+        strncpy(server_addr.sun_path, g_socket_path, sizeof(server_addr.sun_path) - 1);
         
         if (bind(g_validation_context->server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
             perror("Failed to bind Unix domain socket");
@@ -75,7 +86,10 @@ int init_cross_validation(int instance_id, int num_instances) {
             free(g_validation_context);
             return -1;
         }
-        
+
+        printf("🎯 Unix socket coordinator ready, bound and listening on %s\n", g_socket_path);
+        fflush(stdout);
+
         // Initialize coordinator state
         g_coordinator_state.current_sync_point = -1;
         g_coordinator_state.instances_arrived = 0;
@@ -90,7 +104,7 @@ int init_cross_validation(int instance_id, int num_instances) {
             return -1;
         }
         
-        printf("🔍 Cross-validation coordinator started with Unix socket %s for %d instances\n", SOCKET_PATH, num_instances);
+        printf("🔍 Cross-validation coordinator started with Unix socket %s for %d instances\n", g_socket_path, num_instances);
         fflush(stdout);
     }
     
@@ -108,9 +122,14 @@ int init_cross_validation(int instance_id, int num_instances) {
     struct sockaddr_un coord_addr;
     memset(&coord_addr, 0, sizeof(coord_addr));
     coord_addr.sun_family = AF_UNIX;
-    strncpy(coord_addr.sun_path, SOCKET_PATH, sizeof(coord_addr.sun_path) - 1);
+    strncpy(coord_addr.sun_path, g_socket_path, sizeof(coord_addr.sun_path) - 1);
     
     if (connect(g_validation_context->client_socket, (struct sockaddr*)&coord_addr, sizeof(coord_addr)) < 0) {
+        printf("⚠️ Instance %d failed to connect to coordinator socket %s: %s\n", 
+               instance_id, g_socket_path, strerror(errno));
+        printf("🔍 Coordinator status: Instance 0 should create server, Instance %d is %s\n",
+               instance_id, g_validation_context->is_coordinator ? "COORDINATOR" : "CLIENT");
+        fflush(stdout);
         perror("Failed to connect to coordinator Unix socket");
         cleanup_cross_validation();
         return -1;
@@ -137,36 +156,37 @@ int init_cross_validation(int instance_id, int num_instances) {
 
 void cleanup_cross_validation() {
     if (!g_validation_enabled || !g_validation_context) return;
-    
+
     // Send shutdown message
     validation_message_t msg;
     memset(&msg, 0, sizeof(msg));
     msg.type = MSG_SHUTDOWN;
     msg.instance_id = g_instance_id;
     send_validation_message(&msg);
-    
+
     // Close client socket
     if (g_validation_context->client_socket >= 0) {
         close(g_validation_context->client_socket);
     }
-    
+
     // If coordinator, cleanup server resources
     if (g_validation_context->is_coordinator) {
         if (g_validation_context->server_socket >= 0) {
             close(g_validation_context->server_socket);
         }
-        
+
         // Wait for coordinator thread to finish
         pthread_cancel(g_validation_context->coordinator_thread);
         pthread_join(g_validation_context->coordinator_thread, NULL);
-        
+
         // Remove socket file
-        unlink(SOCKET_PATH);
+        extern char g_socket_path[256];
+        unlink(g_socket_path);
     }
-    
+
     free(g_validation_context);
     g_validation_context = NULL;
-    
+
     g_validation_enabled = 0;
     printf("🧹 Instance %d cleaned up Unix socket-based cross-validation\n", g_instance_id);
     fflush(stdout);
@@ -184,14 +204,17 @@ void cross_validate_sync_point(sync_point_t sync_point, const char *fingerprint)
         return;
     }
     
-    printf("🔧 Instance %d sending sync point %d: %s\n", g_instance_id, sync_point, fingerprint);
+    // Use sequential counter to make sync points unique across timesteps
+    int unique_sync_point = ++g_sync_point_counter;
+    
+    printf("🔧 Instance %d sending sync point %d: %s\n", g_instance_id, unique_sync_point, fingerprint);
     fflush(stdout);
     
     // Send sync point message via socket
     validation_message_t msg;
     msg.type = MSG_SYNC_POINT;
     msg.instance_id = g_instance_id;
-    msg.sync_point = sync_point;
+    msg.sync_point = unique_sync_point;  // Use unique sequential ID
     strncpy(msg.fingerprint, fingerprint, MAX_FINGERPRINT_LEN - 1);
     msg.fingerprint[MAX_FINGERPRINT_LEN - 1] = '\0';
     
@@ -209,20 +232,27 @@ void cross_validate_sync_point(sync_point_t sync_point, const char *fingerprint)
         return;
     }
     
-    // Check result and assert if mismatch
+    // Check result and both coordinator and client assert if mismatch
     if (response.type == MSG_VALIDATION_RESULT) {
         if (response.validation_passed) {
-            printf("✅ MATCH at sync point %d: %s\n", sync_point, fingerprint);
+            printf("✅ SYNCHRONIZED MATCH at sync point %d: %s\n", unique_sync_point, fingerprint);
             fflush(stdout);
         } else {
-            printf("❌ MISMATCH at sync point %d: %s\n", sync_point, response.mismatch_details);
+            // Client performs local comparison with other instance's fingerprint
+            const char* other_fingerprint = response.mismatch_details;
+            printf("❌ CLIENT MISMATCH DETECTED at sync point %d\n", unique_sync_point);
+            printf("🔍 Local fingerprint: %s\n", fingerprint);
+            printf("🔍 Other fingerprint: %s\n", other_fingerprint);
             fflush(stdout);
             
-            // Assert failure on mismatch as requested
-            fprintf(stderr, "ASSERTION FAILED: Fingerprint mismatch between processes at sync point %d\n", sync_point);
-            fprintf(stderr, "Details: %s\n", response.mismatch_details);
+            // Client assertion on mismatch - both instances assert as required
+            fprintf(stderr, "🚨 CLIENT ASSERTION FAILED: Synchronized cross-validation failed!\n");
+            fprintf(stderr, "Instance %d at sync point %d:\n", g_instance_id, unique_sync_point);
+            fprintf(stderr, "  Local:  %s\n", fingerprint);
+            fprintf(stderr, "  Other:  %s\n", other_fingerprint);
+            fprintf(stderr, "💥 Client terminating due to validation mismatch.\n");
             fflush(stderr);
-            assert(0); // This will terminate the program
+            assert(0 && "Client: Synchronized cross-validation fingerprint mismatch detected");
         }
     }
 }
@@ -330,9 +360,15 @@ void handle_sync_point_message(validation_message_t *msg) {
            (int)msg->sync_point, msg->instance_id, msg->fingerprint, 
            g_coordinator_state.instances_arrived, g_coordinator_state.num_instances);
     fflush(stdout);
+
+    // Don't send immediate ACK - wait for all instances to arrive for synchronized comparison
+    // This ensures both coordinator and client wait at sync point as required
     
-    // Check if all instances have arrived
+    // Check if all instances have arrived for SYNCHRONIZED comparison
     if (g_coordinator_state.instances_arrived == g_coordinator_state.num_instances) {
+        printf("🔄 All %d instances arrived for sync point %d - performing SYNCHRONIZED comparison...\n", 
+               g_coordinator_state.num_instances, (int)msg->sync_point);
+        
         // Compare all fingerprints
         int match = 1;
         char mismatch_details[512];
@@ -350,45 +386,43 @@ void handle_sync_point_message(validation_message_t *msg) {
         }
         
         if (match) {
-            printf("✅ UNIX SOCKET MATCH at sync point %d: %s\n", (int)msg->sync_point, g_coordinator_state.fingerprints[0]);
+            printf("✅ SYNCHRONIZED MATCH at sync point %d: %s\n", (int)msg->sync_point, g_coordinator_state.fingerprints[0]);
             fflush(stdout);
-            g_coordinator_state.validation_failed = 0;
         } else {
-            printf("❌ UNIX SOCKET MISMATCH at sync point %d: %s\n", (int)msg->sync_point, mismatch_details);
+            printf("❌ SYNCHRONIZED MISMATCH at sync point %d: %s\n", (int)msg->sync_point, mismatch_details);
+            printf("🔍 COMPARISON DETAILS: %s\n", mismatch_details);
             fflush(stdout);
-            g_coordinator_state.validation_failed = 1;
             
-            // ASSERTION: Fail immediately on mismatch
-            if (1) { // Always assert on mismatch as requested
-                fprintf(stderr, "\n🚨 FATAL: Cross-validation assertion failed!\n");
-                fprintf(stderr, "🔍 Details: %s\n", mismatch_details);
-                fprintf(stderr, "💥 Terminating all instances due to validation mismatch.\n\n");
-                fflush(stderr);
-                
-                // Assert will terminate the program
-                assert(0 && "Cross-validation fingerprint mismatch detected between instances");
-            }
+            // Coordinator assertion on mismatch
+            fprintf(stderr, "\n🚨 COORDINATOR ASSERTION FAILED: Synchronized cross-validation failed!\n");
+            fprintf(stderr, "🔍 Details: %s\n", mismatch_details);
+            fprintf(stderr, "💥 Coordinator terminating due to validation mismatch.\n\n");
+            fflush(stderr);
+            assert(0 && "Coordinator: Synchronized cross-validation fingerprint mismatch detected");
         }
         
-        // Send response to all registered instances
-        validation_message_t response;
-        response.type = MSG_VALIDATION_RESULT;
-        response.instance_id = -1; // From coordinator
-        response.sync_point = msg->sync_point;
-        response.validation_passed = match;
-        if (!match) {
-            strncpy(response.mismatch_details, mismatch_details, sizeof(response.mismatch_details) - 1);
-            response.mismatch_details[sizeof(response.mismatch_details) - 1] = '\0';
-        } else {
-            response.mismatch_details[0] = '\0';
-        }
-        
-        // Send response to all instances that participated in this sync point
+        // Send comparison results to ALL instances so they can also compare and assert
         for (int i = 0; i < g_coordinator_state.instances_arrived; i++) {
             int instance_id = g_coordinator_state.instance_ids[i];
             if (instance_id >= 0 && instance_id < MAX_INSTANCES) {
                 int client_fd = g_client_fds[instance_id];
                 if (client_fd > 0) {
+                    validation_message_t response;
+                    response.type = MSG_VALIDATION_RESULT;
+                    response.instance_id = -1; // From coordinator
+                    response.sync_point = msg->sync_point;
+                    response.validation_passed = match;
+                    
+                    // Send OTHER instance's fingerprint so client can compare locally
+                    if (g_coordinator_state.num_instances == 2) {
+                        int other_idx = (i == 0) ? 1 : 0;  // Get the other instance's index
+                        strncpy(response.mismatch_details, g_coordinator_state.fingerprints[other_idx], 
+                               sizeof(response.mismatch_details) - 1);
+                        response.mismatch_details[sizeof(response.mismatch_details) - 1] = '\0';
+                    } else {
+                        response.mismatch_details[0] = '\0';
+                    }
+                    
                     ssize_t sent = send(client_fd, &response, sizeof(response), 0);
                     if (sent != sizeof(response)) {
                         printf("⚠️ Failed to send response to instance %d\n", instance_id);

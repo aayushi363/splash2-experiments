@@ -52,105 +52,94 @@ int init_cross_validation(int instance_id, int num_instances) {
     g_validation_context->instance_id = instance_id;
     g_validation_context->num_instances = num_instances;
     g_validation_context->is_coordinator = (instance_id == 0);
-    
+
     // If this is the coordinator (instance 0), set up Unix domain socket server
     if (g_validation_context->is_coordinator) {
-        // Remove existing socket file
         unlink(g_socket_path);
-        
-        // Create Unix domain socket
         g_validation_context->server_socket = socket(AF_UNIX, SOCK_STREAM, 0);
         if (g_validation_context->server_socket < 0) {
             perror("Failed to create Unix domain socket");
             free(g_validation_context);
             return -1;
         }
-        
-        // Bind socket
+        // Set non-blocking
+        int flags = fcntl(g_validation_context->server_socket, F_GETFL, 0);
+        fcntl(g_validation_context->server_socket, F_SETFL, flags | O_NONBLOCK);
+
         struct sockaddr_un server_addr;
         memset(&server_addr, 0, sizeof(server_addr));
         server_addr.sun_family = AF_UNIX;
         strncpy(server_addr.sun_path, g_socket_path, sizeof(server_addr.sun_path) - 1);
-        
         if (bind(g_validation_context->server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
             perror("Failed to bind Unix domain socket");
             close(g_validation_context->server_socket);
             free(g_validation_context);
             return -1;
         }
-        
-        // Listen for connections
         if (listen(g_validation_context->server_socket, MAX_INSTANCES) < 0) {
             perror("Failed to listen on Unix domain socket");
             close(g_validation_context->server_socket);
             free(g_validation_context);
             return -1;
         }
-
         printf("🎯 Unix socket coordinator ready, bound and listening on %s\n", g_socket_path);
         fflush(stdout);
-
-        // Initialize coordinator state
         g_coordinator_state.current_sync_point = -1;
         g_coordinator_state.instances_arrived = 0;
         g_coordinator_state.validation_failed = 0;
         g_coordinator_state.num_instances = num_instances;
-        
-        // Start coordinator thread
         if (pthread_create(&g_validation_context->coordinator_thread, NULL, coordinator_thread_func, g_validation_context) != 0) {
             perror("Failed to create coordinator thread");
             close(g_validation_context->server_socket);
             free(g_validation_context);
             return -1;
         }
-        
         printf("🔍 Cross-validation coordinator started with Unix socket %s for %d instances\n", g_socket_path, num_instances);
         fflush(stdout);
     }
-    
-    // All instances (including coordinator) create client socket
-    usleep(200000); // 200ms delay to ensure server is ready
-    
+    usleep(200000);
     g_validation_context->client_socket = socket(AF_UNIX, SOCK_STREAM, 0);
     if (g_validation_context->client_socket < 0) {
         perror("Failed to create client Unix socket");
         cleanup_cross_validation();
         return -1;
     }
-    
-    // Connect to coordinator
+    // Set non-blocking
+    int cflags = fcntl(g_validation_context->client_socket, F_GETFL, 0);
+    fcntl(g_validation_context->client_socket, F_SETFL, cflags | O_NONBLOCK);
     struct sockaddr_un coord_addr;
     memset(&coord_addr, 0, sizeof(coord_addr));
     coord_addr.sun_family = AF_UNIX;
     strncpy(coord_addr.sun_path, g_socket_path, sizeof(coord_addr.sun_path) - 1);
-    
-    if (connect(g_validation_context->client_socket, (struct sockaddr*)&coord_addr, sizeof(coord_addr)) < 0) {
-        printf("⚠️ Instance %d failed to connect to coordinator socket %s: %s\n", 
-               instance_id, g_socket_path, strerror(errno));
-        printf("🔍 Coordinator status: Instance 0 should create server, Instance %d is %s\n",
-               instance_id, g_validation_context->is_coordinator ? "COORDINATOR" : "CLIENT");
-        fflush(stdout);
+    int connect_attempts = 0;
+    while (connect(g_validation_context->client_socket, (struct sockaddr*)&coord_addr, sizeof(coord_addr)) < 0) {
+        if (errno == EINTR || errno == EAGAIN || errno == ENOENT) {
+            usleep(100000);
+            if (++connect_attempts > 50) {
+                perror("Failed to connect to coordinator Unix socket (timeout)");
+                cleanup_cross_validation();
+                return -1;
+            }
+            continue;
+        }
         perror("Failed to connect to coordinator Unix socket");
         cleanup_cross_validation();
         return -1;
     }
-    
-    // Register this instance
+    // Set back to blocking after connect
+    fcntl(g_validation_context->client_socket, F_SETFL, cflags & ~O_NONBLOCK);
     validation_message_t msg;
     memset(&msg, 0, sizeof(msg));
     msg.type = MSG_REGISTER_INSTANCE;
     msg.instance_id = instance_id;
-    
     if (send_validation_message(&msg) < 0) {
         fprintf(stderr, "Failed to register instance %d\n", instance_id);
         cleanup_cross_validation();
         return -1;
     }
-    
     g_validation_enabled = 1;
     printf("✅ Instance %d connected to Unix socket-based cross-validation system\n", instance_id);
     fflush(stdout);
-    
     return 0;
 }
 
@@ -204,48 +193,56 @@ void cross_validate_sync_point(sync_point_t sync_point, const char *fingerprint)
         return;
     }
     
-    // Use sequential counter to make sync points unique across timesteps
     int unique_sync_point = ++g_sync_point_counter;
-    
     printf("🔧 Instance %d sending sync point %d: %s\n", g_instance_id, unique_sync_point, fingerprint);
     fflush(stdout);
-    
-    // Send sync point message via socket
     validation_message_t msg;
     msg.type = MSG_SYNC_POINT;
     msg.instance_id = g_instance_id;
-    msg.sync_point = unique_sync_point;  // Use unique sequential ID
+    msg.sync_point = unique_sync_point;
     strncpy(msg.fingerprint, fingerprint, MAX_FINGERPRINT_LEN - 1);
     msg.fingerprint[MAX_FINGERPRINT_LEN - 1] = '\0';
-    
-    ssize_t sent = send(g_validation_context->client_socket, &msg, sizeof(msg), 0);
-    if (sent != sizeof(msg)) {
+    int retries = 0;
+    while (1) {
+        ssize_t sent = send(g_validation_context->client_socket, &msg, sizeof(msg), 0);
+        if (sent == sizeof(msg)) break;
+        if (errno == EINTR || errno == EAGAIN || errno == ENOMEM) {
+            if (++retries > 100) {
+                printf("❌ Instance %d failed to send sync point message after retries: %s\n", g_instance_id, strerror(errno));
+                return;
+            }
+            usleep(10000);
+            continue;
+        }
         printf("❌ Instance %d failed to send sync point message: %s\n", g_instance_id, strerror(errno));
         return;
     }
-    
-    // Wait for validation result from coordinator
     validation_message_t response;
-    ssize_t received = recv(g_validation_context->client_socket, &response, sizeof(response), 0);
-    if (received != sizeof(response)) {
+    retries = 0;
+    while (1) {
+        ssize_t received = recv(g_validation_context->client_socket, &response, sizeof(response), 0);
+        if (received == sizeof(response)) break;
+        if (errno == EINTR || errno == EAGAIN || errno == ENOMEM) {
+            if (++retries > 100) {
+                printf("❌ Instance %d failed to receive validation result after retries: %s\n", g_instance_id, strerror(errno));
+                return;
+            }
+            usleep(10000);
+            continue;
+        }
         printf("❌ Instance %d failed to receive validation result: %s\n", g_instance_id, strerror(errno));
         return;
     }
-    
-    // Check result and both coordinator and client assert if mismatch
     if (response.type == MSG_VALIDATION_RESULT) {
         if (response.validation_passed) {
             printf("✅ SYNCHRONIZED MATCH at sync point %d: %s\n", unique_sync_point, fingerprint);
             fflush(stdout);
         } else {
-            // Client performs local comparison with other instance's fingerprint
             const char* other_fingerprint = response.mismatch_details;
             printf("❌ CLIENT MISMATCH DETECTED at sync point %d\n", unique_sync_point);
             printf("🔍 Local fingerprint: %s\n", fingerprint);
             printf("🔍 Other fingerprint: %s\n", other_fingerprint);
             fflush(stdout);
-            
-            // Client assertion on mismatch - both instances assert as required
             fprintf(stderr, "🚨 CLIENT ASSERTION FAILED: Synchronized cross-validation failed!\n");
             fprintf(stderr, "Instance %d at sync point %d:\n", g_instance_id, unique_sync_point);
             fprintf(stderr, "  Local:  %s\n", fingerprint);
@@ -316,26 +313,40 @@ int send_validation_message(validation_message_t *msg) {
         return -1;
     }
     
-    ssize_t bytes_sent = send(g_validation_context->client_socket, msg, sizeof(validation_message_t), 0);
-    if (bytes_sent != sizeof(validation_message_t)) {
+    int retries = 0;
+    while (1) {
+        ssize_t bytes_sent = send(g_validation_context->client_socket, msg, sizeof(validation_message_t), 0);
+        if (bytes_sent == sizeof(validation_message_t)) return 0;
+        if (errno == EINTR || errno == EAGAIN || errno == ENOMEM) {
+            if (++retries > 100) {
+                perror("Failed to send validation message after retries");
+                return -1;
+            }
+            usleep(10000);
+            continue;
+        }
         perror("Failed to send validation message");
         return -1;
     }
-    
-    return 0;
 }
 
 int receive_validation_message(int client_socket, validation_message_t *msg) {
-    ssize_t bytes_received = recv(client_socket, msg, sizeof(validation_message_t), 0);
-    if (bytes_received != sizeof(validation_message_t)) {
-        if (bytes_received == 0) {
-            return 0; // Connection closed
+    int retries = 0;
+    while (1) {
+        ssize_t bytes_received = recv(client_socket, msg, sizeof(validation_message_t), 0);
+        if (bytes_received == sizeof(validation_message_t)) return 1;
+        if (bytes_received == 0) return 0;
+        if (errno == EINTR || errno == EAGAIN || errno == ENOMEM) {
+            if (++retries > 100) {
+                perror("Failed to receive validation message after retries");
+                return -1;
+            }
+            usleep(10000);
+            continue;
         }
         perror("Failed to receive validation message");
         return -1;
     }
-    
-    return 1; // Success
 }
 
 // Handle sync point messages from instances with assertion on mismatch

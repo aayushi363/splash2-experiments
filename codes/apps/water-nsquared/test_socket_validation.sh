@@ -41,7 +41,7 @@ if [ "$MODE" = "mcmini" ]; then
     timeout --signal=SIGINT 60s /home/aayushi/tmp-mcmini/mcmini/dmtcp/build/mcmini \
         --coord-port 7780 \
         --ckptdir /tmp/mcmini_test1 \
-        --interval 10 \
+        --interval 3 \
         --log-level 1 \
         ./WATER-NSQUARED < input &
 else
@@ -60,7 +60,7 @@ if [ "$MODE" = "mcmini" ]; then
     timeout --signal=SIGINT 60s /home/aayushi/tmp-mcmini/mcmini/dmtcp/build/mcmini \
         --coord-port 7781 \
         --ckptdir /tmp/mcmini_test2 \
-        --interval 10 \
+        --interval 3 \
         --log-level 1 \
         ./WATER-NSQUARED < input &
 else

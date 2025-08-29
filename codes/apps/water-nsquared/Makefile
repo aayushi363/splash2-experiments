@@ -1,3 +1,13 @@
+### DMTCP support
+# Set these to your DMTCP install location
+DMTCP_INCLUDE = /home/aayushi/dmtcp/include
+DMTCP_LIB = /home/aayushi/dmtcp/lib
+
+# Add DMTCP flags if DMTCP is enabled
+ifdef DMTCP
+CFLAGS += -DDMTCP -I$(DMTCP_INCLUDE)
+LDFLAGS += -L$(DMTCP_LIB) -ldmtcp
+endif
 TARGET = WATER-NSQUARED
 OBJS = bndry.o cnstnt.o cshift.o initia.o interf.o intraf.o kineti.o mdmain.o poteng.o predcor.o syscons.o water.o cross_validation.o
 
@@ -15,4 +25,10 @@ poteng.o: poteng.C global.h split.h mdvar.h frcnst.h water.h wwpot.h parameters.
 predcor.o: predcor.C split.h mdvar.h parameters.h mddata.h global.h
 syscons.o: syscons.C parameters.h mdvar.h water.h wwpot.h cnst.h mddata.h global.h
 water.o: water.C parameters.h mdvar.h water.h wwpot.h cnst.h mddata.h fileio.h frcnst.h randno.h global.h split.h cross_validation.h
+
 cross_validation.o: cross_validation.c cross_validation.h
+ifdef DMTCP
+	$(CC) $(CFLAGS) -c cross_validation.c
+else
+	$(CC) -c cross_validation.c
+endif

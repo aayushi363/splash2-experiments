@@ -5,6 +5,11 @@
 #include <math.h>
 #include <ctype.h>
 
+// DMTCP support
+#ifdef DMTCP
+#include "dmtcp.h"
+#endif
+
 // Global validation state
 validation_context_t *g_validation_context = NULL;
 cross_validation_t *g_validation = NULL;
@@ -13,6 +18,11 @@ int g_instance_id = 0;
 char g_socket_path[256];
 int g_client_fds[16];
 int g_sync_point_counter = 0;  // Sequential counter for unique sync points
+
+// DMTCP checkpoint state
+static int saved_instance_id = -1;
+static int saved_num_instances = -1;
+static volatile int checkpoint_in_progress = 0;
 
 // Coordinator state
 typedef struct {
@@ -26,6 +36,9 @@ typedef struct {
 } coordinator_state_t;
 
 static coordinator_state_t g_coordinator_state = {0};
+
+// Forward declaration for DMTCP functions
+static void close_validation_sockets(void);
 
 int init_cross_validation(int instance_id, int num_instances) {
     if (num_instances > MAX_INSTANCES) {
@@ -113,7 +126,7 @@ int init_cross_validation(int instance_id, int num_instances) {
     strncpy(coord_addr.sun_path, g_socket_path, sizeof(coord_addr.sun_path) - 1);
     int connect_attempts = 0;
     while (connect(g_validation_context->client_socket, (struct sockaddr*)&coord_addr, sizeof(coord_addr)) < 0) {
-        if (errno == EINTR || errno == EAGAIN || errno == ENOENT) {
+        if (errno == EINPROGRESS || errno == EALREADY || errno == EINTR || errno == EAGAIN || errno == ENOENT) {
             usleep(100000);
             if (++connect_attempts > 50) {
                 perror("Failed to connect to coordinator Unix socket (timeout)");
@@ -143,35 +156,56 @@ int init_cross_validation(int instance_id, int num_instances) {
     return 0;
 }
 
+static void close_validation_sockets(void) {
+    if (!g_validation_context) return;
+    
+    checkpoint_in_progress = 1;
+    
+    // Stop coordinator thread if running
+    if (g_validation_context->is_coordinator && g_validation_context->coordinator_thread) {
+        pthread_cancel(g_validation_context->coordinator_thread);
+        pthread_join(g_validation_context->coordinator_thread, NULL);
+        g_validation_context->coordinator_thread = 0;
+    }
+    
+    // Close all sockets
+    if (g_validation_context->client_socket >= 0) {
+        close(g_validation_context->client_socket);
+        g_validation_context->client_socket = -1;
+    }
+    
+    if (g_validation_context->server_socket >= 0) {
+        close(g_validation_context->server_socket);
+        g_validation_context->server_socket = -1;
+    }
+    
+    // Close all client fds in coordinator
+    for (int i = 0; i < MAX_INSTANCES; i++) {
+        if (g_client_fds[i] >= 0) {
+            close(g_client_fds[i]);
+            g_client_fds[i] = -1;
+        }
+    }
+    
+    // Remove socket file
+    if (g_validation_context->is_coordinator) {
+        unlink(g_socket_path);
+    }
+}
+
 void cleanup_cross_validation() {
     if (!g_validation_enabled || !g_validation_context) return;
 
-    // Send shutdown message
-    validation_message_t msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.type = MSG_SHUTDOWN;
-    msg.instance_id = g_instance_id;
-    send_validation_message(&msg);
-
-    // Close client socket
+    // Send shutdown message if socket is still open
     if (g_validation_context->client_socket >= 0) {
-        close(g_validation_context->client_socket);
+        validation_message_t msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.type = MSG_SHUTDOWN;
+        msg.instance_id = g_instance_id;
+        send_validation_message(&msg);
     }
 
-    // If coordinator, cleanup server resources
-    if (g_validation_context->is_coordinator) {
-        if (g_validation_context->server_socket >= 0) {
-            close(g_validation_context->server_socket);
-        }
-
-        // Wait for coordinator thread to finish
-        pthread_cancel(g_validation_context->coordinator_thread);
-        pthread_join(g_validation_context->coordinator_thread, NULL);
-
-        // Remove socket file
-        extern char g_socket_path[256];
-        unlink(g_socket_path);
-    }
+    close_validation_sockets();
 
     free(g_validation_context);
     g_validation_context = NULL;
@@ -193,46 +227,111 @@ void cross_validate_sync_point(sync_point_t sync_point, const char *fingerprint)
         return;
     }
     
+    // Skip validation if checkpoint is in progress
+    if (checkpoint_in_progress) {
+        printf("[CV-DEBUG] Skipping validation during checkpoint\n");
+        return;
+    }
+    
     int unique_sync_point = ++g_sync_point_counter;
     printf("🔧 Instance %d sending sync point %d: %s\n", g_instance_id, unique_sync_point, fingerprint);
     fflush(stdout);
+    
     validation_message_t msg;
     msg.type = MSG_SYNC_POINT;
     msg.instance_id = g_instance_id;
     msg.sync_point = unique_sync_point;
     strncpy(msg.fingerprint, fingerprint, MAX_FINGERPRINT_LEN - 1);
     msg.fingerprint[MAX_FINGERPRINT_LEN - 1] = '\0';
-    int retries = 0;
-    while (1) {
-        ssize_t sent = send(g_validation_context->client_socket, &msg, sizeof(msg), 0);
-        if (sent == sizeof(msg)) break;
-        if (errno == EINTR || errno == EAGAIN || errno == ENOMEM) {
-            if (++retries > 100) {
-                printf("❌ Instance %d failed to send sync point message after retries: %s\n", g_instance_id, strerror(errno));
+    
+    // Send with proper EINTR handling
+    size_t total_sent = 0;
+    char *buffer = (char*)&msg;
+    while (total_sent < sizeof(msg)) {
+        ssize_t sent = send(g_validation_context->client_socket, 
+                           buffer + total_sent, 
+                           sizeof(msg) - total_sent, 
+                           MSG_NOSIGNAL);
+        
+        if (sent > 0) {
+            total_sent += sent;
+        } else if (sent < 0) {
+            if (errno == EINTR) {
+                continue;  // Retry immediately on interrupt
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Socket buffer full, wait a bit
+                usleep(10000);
+                continue;
+            } else {
+                printf("❌ Instance %d failed to send sync point message: %s\n", 
+                       g_instance_id, strerror(errno));
                 return;
             }
-            usleep(10000);
-            continue;
         }
-        printf("❌ Instance %d failed to send sync point message: %s\n", g_instance_id, strerror(errno));
-        return;
     }
+    
+    // Receive response with timeout using select
     validation_message_t response;
-    retries = 0;
-    while (1) {
-        ssize_t received = recv(g_validation_context->client_socket, &response, sizeof(response), 0);
-        if (received == sizeof(response)) break;
-        if (errno == EINTR || errno == EAGAIN || errno == ENOMEM) {
-            if (++retries > 100) {
-                printf("❌ Instance %d failed to receive validation result after retries: %s\n", g_instance_id, strerror(errno));
-                return;
+    fd_set readfds;
+    struct timeval tv;
+    int max_wait_ms = 5000;  // 5 second total timeout
+    int elapsed_ms = 0;
+    
+    size_t total_received = 0;
+    char *recv_buffer = (char*)&response;
+    
+    while (total_received < sizeof(response) && elapsed_ms < max_wait_ms) {
+        FD_ZERO(&readfds);
+        FD_SET(g_validation_context->client_socket, &readfds);
+        
+        tv.tv_sec = 0;
+        tv.tv_usec = 100000;  // 100ms per select
+        
+        int ret = select(g_validation_context->client_socket + 1, &readfds, NULL, NULL, &tv);
+        
+        if (ret < 0) {
+            if (errno == EINTR) {
+                continue;  // Retry on interrupt
             }
-            usleep(10000);
+            printf("❌ Instance %d select failed: %s\n", g_instance_id, strerror(errno));
+            return;
+        }
+        
+        if (ret == 0) {
+            // Timeout - no data yet
+            elapsed_ms += 100;
             continue;
         }
-        printf("❌ Instance %d failed to receive validation result: %s\n", g_instance_id, strerror(errno));
+        
+        // Data available, try to receive
+        ssize_t received = recv(g_validation_context->client_socket,
+                               recv_buffer + total_received,
+                               sizeof(response) - total_received,
+                               MSG_DONTWAIT);
+        
+        if (received > 0) {
+            total_received += received;
+        } else if (received < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                elapsed_ms += 100;
+                continue;
+            }
+            printf("❌ Instance %d failed to receive validation result: %s\n", 
+                   g_instance_id, strerror(errno));
+            return;
+        } else {
+            // Connection closed
+            printf("❌ Instance %d connection closed while waiting for validation\n", g_instance_id);
+            return;
+        }
+    }
+    
+    if (total_received < sizeof(response)) {
+        printf("⚠️ Instance %d timeout waiting for validation response\n", g_instance_id);
         return;
     }
+    
+    // Process response as before
     if (response.type == MSG_VALIDATION_RESULT) {
         if (response.validation_passed) {
             printf("✅ SYNCHRONIZED MATCH at sync point %d: %s\n", unique_sync_point, fingerprint);
@@ -313,40 +412,74 @@ int send_validation_message(validation_message_t *msg) {
         return -1;
     }
     
-    int retries = 0;
-    while (1) {
-        ssize_t bytes_sent = send(g_validation_context->client_socket, msg, sizeof(validation_message_t), 0);
-        if (bytes_sent == sizeof(validation_message_t)) return 0;
-        if (errno == EINTR || errno == EAGAIN || errno == ENOMEM) {
-            if (++retries > 100) {
-                perror("Failed to send validation message after retries");
-                return -1;
+    size_t total_sent = 0;
+    char *buffer = (char*)msg;
+    size_t remaining = sizeof(*msg);
+    
+    while (remaining > 0) {
+        ssize_t bytes_sent = send(g_validation_context->client_socket, 
+                                  buffer + total_sent, 
+                                  remaining, 
+                                  MSG_NOSIGNAL);
+        if (bytes_sent > 0) {
+            total_sent += bytes_sent;
+            remaining -= bytes_sent;
+        } else if (bytes_sent < 0) {
+            if (errno == EINTR) {
+                continue;
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                usleep(10000);
+                continue;
             }
-            usleep(10000);
-            continue;
+            perror("Failed to send validation message");
+            return -1;
         }
-        perror("Failed to send validation message");
-        return -1;
     }
+    return 0;
 }
 
 int receive_validation_message(int client_socket, validation_message_t *msg) {
-    int retries = 0;
-    while (1) {
-        ssize_t bytes_received = recv(client_socket, msg, sizeof(validation_message_t), 0);
-        if (bytes_received == sizeof(validation_message_t)) return 1;
-        if (bytes_received == 0) return 0;
-        if (errno == EINTR || errno == EAGAIN || errno == ENOMEM) {
-            if (++retries > 100) {
-                perror("Failed to receive validation message after retries");
+    size_t total_received = 0;
+    char *buffer = (char*)msg;
+    size_t remaining = sizeof(*msg);
+    
+    // Try to receive with non-blocking and handle partial messages
+    while (remaining > 0) {
+        ssize_t received = recv(client_socket, buffer + total_received, remaining, MSG_DONTWAIT);
+        
+        if (received > 0) {
+            total_received += received;
+            remaining -= received;
+        } else if (received == 0) {
+            // Connection closed
+            if (total_received > 0) {
+                // Partial message received before close
                 return -1;
             }
-            usleep(10000);
-            continue;
+            return 0;  // Clean close
+        } else {
+            // Error occurred
+            if (errno == EINTR) {
+                // Interrupted by signal, retry
+                continue;
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // No data available right now
+                if (total_received == 0) {
+                    // Nothing received yet, return special code
+                    return -2;
+                }
+                // Partial message, wait a bit and retry
+                usleep(10000);
+                continue;
+            } else {
+                // Real error
+                perror("recv failed in receive_validation_message");
+                return -1;
+            }
         }
-        perror("Failed to receive validation message");
-        return -1;
     }
+    
+    return 1;  // Complete message received
 }
 
 // Handle sync point messages from instances with assertion on mismatch
@@ -434,7 +567,7 @@ void handle_sync_point_message(validation_message_t *msg) {
                         response.mismatch_details[0] = '\0';
                     }
                     
-                    ssize_t sent = send(client_fd, &response, sizeof(response), 0);
+                    ssize_t sent = send(client_fd, &response, sizeof(response), MSG_NOSIGNAL);
                     if (sent != sizeof(response)) {
                         printf("⚠️ Failed to send response to instance %d\n", instance_id);
                     } else {
@@ -465,12 +598,29 @@ void* coordinator_thread_func(void* arg) {
     printf("🎯 Unix socket coordinator thread started, waiting for %d instances\n", ctx->num_instances);
     fflush(stdout);
     
+    // Set timeout for select to avoid indefinite blocking
+    struct timeval tv;
+    
     while (registered_instances < ctx->num_instances) {
         read_fds = master_fds;
         
-        if (select(max_fd + 1, &read_fds, NULL, NULL, NULL) < 0) {
+        // Use 100ms timeout for select
+        tv.tv_sec = 0;
+        tv.tv_usec = 100000;
+        
+        int ret = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
+        if (ret < 0) {
+            if (errno == EINTR) {
+                // Interrupted by signal (likely checkpoint), continue
+                continue;
+            }
             perror("select failed in coordinator");
             break;
+        }
+        
+        if (ret == 0) {
+            // Timeout - no events, continue loop
+            continue;
         }
         
         // Check for new connections
@@ -480,9 +630,16 @@ void* coordinator_thread_func(void* arg) {
             int client_fd = accept(ctx->server_socket, (struct sockaddr*)&client_addr, &client_len);
             
             if (client_fd < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
                 perror("accept failed");
                 continue;
             }
+            
+            // Set new client socket to non-blocking
+            int flags = fcntl(client_fd, F_GETFL, 0);
+            fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
             
             FD_SET(client_fd, &master_fds);
             if (client_fd > max_fd) {
@@ -499,8 +656,13 @@ void* coordinator_thread_func(void* arg) {
                 validation_message_t msg;
                 int result = receive_validation_message(fd, &msg);
                 
+                if (result == -2) {
+                    // Timeout or would block - continue
+                    continue;
+                }
+                
                 if (result <= 0) {
-                    // Client disconnected
+                    // Client disconnected or error
                     close(fd);
                     FD_CLR(fd, &master_fds);
                     continue;
@@ -508,13 +670,12 @@ void* coordinator_thread_func(void* arg) {
                 
                 if (msg.type == MSG_REGISTER_INSTANCE) {
                     client_fds[msg.instance_id] = fd;
-                    g_client_fds[msg.instance_id] = fd; // Also store in global array
+                    g_client_fds[msg.instance_id] = fd;
                     registered_instances++;
                     printf("✅ Instance %d registered (fd=%d), total: %d/%d\n", 
                            msg.instance_id, fd, registered_instances, ctx->num_instances);
                     fflush(stdout);
                 } else if (msg.type == MSG_SYNC_POINT) {
-                    // Handle sync point validation
                     handle_sync_point_message(&msg);
                 } else if (msg.type == MSG_SHUTDOWN) {
                     printf("🛑 Instance %d shutting down\n", msg.instance_id);
@@ -531,15 +692,34 @@ void* coordinator_thread_func(void* arg) {
     while (1) {
         read_fds = master_fds;
         
-        if (select(max_fd + 1, &read_fds, NULL, NULL, NULL) < 0) {
+        // Use 100ms timeout
+        tv.tv_sec = 0;
+        tv.tv_usec = 100000;
+        
+        int ret = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
+        if (ret < 0) {
+            if (errno == EINTR) {
+                // Interrupted by signal, continue
+                continue;
+            }
             perror("select failed in coordinator main loop");
             break;
+        }
+        
+        if (ret == 0) {
+            // Timeout - no events, continue
+            continue;
         }
         
         for (int fd = 0; fd <= max_fd; fd++) {
             if (fd != ctx->server_socket && FD_ISSET(fd, &read_fds)) {
                 validation_message_t msg;
                 int result = receive_validation_message(fd, &msg);
+                
+                if (result == -2) {
+                    // Timeout or would block - continue
+                    continue;
+                }
                 
                 if (result <= 0) {
                     close(fd);
@@ -559,3 +739,82 @@ void* coordinator_thread_func(void* arg) {
     
     return NULL;
 }
+
+#ifdef DMTCP
+// DMTCP Event Hook function
+static void cross_validation_EventHook(DmtcpEvent_t event, DmtcpEventData_t *data) {
+    switch (event) {
+        case DMTCP_EVENT_INIT:
+            // Plugin initialization - nothing needed here
+            printf("[CV-DEBUG] DMTCP plugin initialized\n");
+            fflush(stdout);
+            break;
+            
+        case DMTCP_EVENT_PRECHECKPOINT:
+            printf("[CV-DEBUG] DMTCP Pre-checkpoint: Closing validation sockets\n");
+            fflush(stdout);
+            
+            if (g_validation_context) {
+                // Save configuration
+                saved_instance_id = g_validation_context->instance_id;
+                saved_num_instances = g_validation_context->num_instances;
+                
+                // Close all sockets to prevent DMTCP from trying to checkpoint them
+                close_validation_sockets();
+                
+                // Free the context
+                free(g_validation_context);
+                g_validation_context = NULL;
+                g_validation_enabled = 0;
+            }
+            break;
+            
+        case DMTCP_EVENT_RESUME:
+            printf("[CV-DEBUG] DMTCP Resume: Reinitializing validation system\n");
+            fflush(stdout);
+            
+            checkpoint_in_progress = 0;
+            
+            if (saved_instance_id >= 0 && saved_num_instances > 0) {
+                // Reset globals
+                g_sync_point_counter = 0;
+                memset(g_client_fds, -1, sizeof(g_client_fds));
+                
+                // Small delay to ensure both processes are ready
+                usleep(500000); // 500ms
+                
+                // Reinitialize the validation system
+                printf("[CV-DEBUG] Reinitializing validation for instance %d of %d\n", 
+                       saved_instance_id, saved_num_instances);
+                fflush(stdout);
+                
+                init_cross_validation(saved_instance_id, saved_num_instances);
+            }
+            break;
+            
+        case DMTCP_EVENT_RESTART:
+            // This is for restart from checkpoint file, not resume
+            // We don't handle this case for now
+            printf("[CV-DEBUG] DMTCP Restart from checkpoint - not handled\n");
+            fflush(stdout);
+            break;
+            
+        default:
+            break;
+    }
+}
+
+// Plugin descriptor
+static DmtcpPluginDescriptor_t cross_validation_plugin = {
+    DMTCP_PLUGIN_API_VERSION,
+    DMTCP_PACKAGE_VERSION,
+    "cross_validation",
+    "DMTCP",
+    "dmtcp@ccs.neu.edu",
+    "Cross-validation plugin for synchronized validation",
+    cross_validation_EventHook
+};
+
+// Register the plugin (this macro expands to the constructor function)
+DMTCP_DECL_PLUGIN(cross_validation_plugin);
+#endif // DMTCP

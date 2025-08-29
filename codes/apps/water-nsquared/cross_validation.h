@@ -16,6 +16,12 @@
 #include <pthread.h>
 #include <sys/select.h>
 
+// DMTCP integration for checkpoint awareness
+#ifdef DMTCP
+#include "dmtcp.h"
+#include "dmtcpalloc.h"
+#endif
+
 #define MAX_INSTANCES 4
 #define MAX_FINGERPRINT_LEN 256
 #define MAX_SYNC_POINTS 20
@@ -52,7 +58,9 @@ typedef enum {
     MSG_REGISTER_INSTANCE = 1,
     MSG_SYNC_POINT = 2,
     MSG_VALIDATION_RESULT = 3,
-    MSG_SHUTDOWN = 4
+    MSG_SHUTDOWN = 4,
+    MSG_HEARTBEAT = 5,
+    MSG_RESUME_READY = 6
 } message_type_t;
 
 // Socket message structure
@@ -103,10 +111,23 @@ void cleanup_cross_validation();
 void cross_validate_sync_point(sync_point_t sync_point, const char *fingerprint);
 void generate_fingerprint(char *buffer, size_t buffer_size, const char *format, ...);
 int compare_fingerprints_with_tolerance(const char *fp1, const char *fp2);
+void cleanup_validation_memory();
+int check_memory_availability();
+int is_system_ready_for_checkpoint();
+ssize_t dmtcp_aware_receive(int socket_fd, void *buffer, size_t length, int timeout_seconds);
 int send_validation_message(validation_message_t *msg);
 int receive_validation_message(int client_socket, validation_message_t *msg);
 void handle_sync_point_message(validation_message_t *msg);
 void* coordinator_thread_func(void* arg);
+
+// DMTCP checkpoint-aware functions
+#ifdef DMTCP
+void dmtcp_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data);
+void checkpoint_validation_state();
+void restore_validation_state();
+int reestablish_socket_connections();
+int reinitialize_cross_validation_after_restart();
+#endif
 
 // Macros for easy integration
 #define CROSS_VALIDATE_SYNC(sync_point, ...) \

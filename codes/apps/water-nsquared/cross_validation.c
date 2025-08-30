@@ -3,7 +3,11 @@
 #include <stdarg.h>
 #include <time.h>
 #include <math.h>
+
 #include <ctype.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
 
 // DMTCP support
 #ifdef DMTCP
@@ -48,11 +52,22 @@ int init_cross_validation(int instance_id, int num_instances) {
     
     g_instance_id = instance_id;
 
-    // Create shared socket path that works across McMini instances
-    // Use a fixed path that both instances can access
-    snprintf(g_socket_path, sizeof(g_socket_path), "/tmp/water_validation_shared");
-    
-    printf("🔧 Instance %d using shared socket path: %s\n", instance_id, g_socket_path);
+    // Get server address and port from environment or use defaults
+    const char *server_addr_env = getenv("CROSS_VALIDATION_SERVER_ADDR");
+    const char *server_port_env = getenv("CROSS_VALIDATION_SERVER_PORT");
+    char server_addr_str[64];
+    int server_port = 5000;
+    if (server_addr_env && server_addr_env[0]) {
+        strncpy(server_addr_str, server_addr_env, sizeof(server_addr_str)-1);
+        server_addr_str[sizeof(server_addr_str)-1] = '\0';
+    } else {
+        strcpy(server_addr_str, "0.0.0.0");
+    }
+    if (server_port_env && server_port_env[0]) {
+        server_port = atoi(server_port_env);
+        if (server_port <= 0) server_port = 5000;
+    }
+    printf("🔧 Instance %d using TCP validation at %s:%d\n", instance_id, server_addr_str, server_port);
     fflush(stdout);
     
     // Allocate validation context
@@ -66,36 +81,39 @@ int init_cross_validation(int instance_id, int num_instances) {
     g_validation_context->num_instances = num_instances;
     g_validation_context->is_coordinator = (instance_id == 0);
 
-    // If this is the coordinator (instance 0), set up Unix domain socket server
+    // If this is the coordinator (instance 0), set up TCP server
     if (g_validation_context->is_coordinator) {
-        unlink(g_socket_path);
-        g_validation_context->server_socket = socket(AF_UNIX, SOCK_STREAM, 0);
+        g_validation_context->server_socket = socket(AF_INET, SOCK_STREAM, 0);
         if (g_validation_context->server_socket < 0) {
-            perror("Failed to create Unix domain socket");
+            perror("Failed to create TCP server socket");
             free(g_validation_context);
             return -1;
         }
-        // Set non-blocking
-        int flags = fcntl(g_validation_context->server_socket, F_GETFL, 0);
-        fcntl(g_validation_context->server_socket, F_SETFL, flags | O_NONBLOCK);
-
-        struct sockaddr_un server_addr;
+        int optval = 1;
+        setsockopt(g_validation_context->server_socket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+        struct sockaddr_in server_addr;
         memset(&server_addr, 0, sizeof(server_addr));
-        server_addr.sun_family = AF_UNIX;
-        strncpy(server_addr.sun_path, g_socket_path, sizeof(server_addr.sun_path) - 1);
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(server_port);
+        if (inet_pton(AF_INET, server_addr_str, &server_addr.sin_addr) <= 0) {
+            perror("Invalid server address");
+            close(g_validation_context->server_socket);
+            free(g_validation_context);
+            return -1;
+        }
         if (bind(g_validation_context->server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-            perror("Failed to bind Unix domain socket");
+            perror("Failed to bind TCP server socket");
             close(g_validation_context->server_socket);
             free(g_validation_context);
             return -1;
         }
         if (listen(g_validation_context->server_socket, MAX_INSTANCES) < 0) {
-            perror("Failed to listen on Unix domain socket");
+            perror("Failed to listen on TCP server socket");
             close(g_validation_context->server_socket);
             free(g_validation_context);
             return -1;
         }
-        printf("🎯 Unix socket coordinator ready, bound and listening on %s\n", g_socket_path);
+        printf("🎯 TCP coordinator ready, bound and listening on %s:%d\n", server_addr_str, server_port);
         fflush(stdout);
         g_coordinator_state.current_sync_point = -1;
         g_coordinator_state.instances_arrived = 0;
@@ -107,40 +125,40 @@ int init_cross_validation(int instance_id, int num_instances) {
             free(g_validation_context);
             return -1;
         }
-        printf("🔍 Cross-validation coordinator started with Unix socket %s for %d instances\n", g_socket_path, num_instances);
+        printf("🔍 Cross-validation coordinator started with TCP %s:%d for %d instances\n", server_addr_str, server_port, num_instances);
         fflush(stdout);
     }
     usleep(200000);
-    g_validation_context->client_socket = socket(AF_UNIX, SOCK_STREAM, 0);
+    g_validation_context->client_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (g_validation_context->client_socket < 0) {
-        perror("Failed to create client Unix socket");
+        perror("Failed to create TCP client socket");
         cleanup_cross_validation();
         return -1;
     }
-    // Set non-blocking
-    int cflags = fcntl(g_validation_context->client_socket, F_GETFL, 0);
-    fcntl(g_validation_context->client_socket, F_SETFL, cflags | O_NONBLOCK);
-    struct sockaddr_un coord_addr;
+    struct sockaddr_in coord_addr;
     memset(&coord_addr, 0, sizeof(coord_addr));
-    coord_addr.sun_family = AF_UNIX;
-    strncpy(coord_addr.sun_path, g_socket_path, sizeof(coord_addr.sun_path) - 1);
+    coord_addr.sin_family = AF_INET;
+    coord_addr.sin_port = htons(server_port);
+    if (inet_pton(AF_INET, server_addr_str, &coord_addr.sin_addr) <= 0) {
+        perror("Invalid coordinator address");
+        cleanup_cross_validation();
+        return -1;
+    }
     int connect_attempts = 0;
     while (connect(g_validation_context->client_socket, (struct sockaddr*)&coord_addr, sizeof(coord_addr)) < 0) {
-        if (errno == EINPROGRESS || errno == EALREADY || errno == EINTR || errno == EAGAIN || errno == ENOENT) {
+        if (errno == EINPROGRESS || errno == EALREADY || errno == EINTR || errno == EAGAIN) {
             usleep(100000);
             if (++connect_attempts > 50) {
-                perror("Failed to connect to coordinator Unix socket (timeout)");
+                perror("Failed to connect to coordinator TCP socket (timeout)");
                 cleanup_cross_validation();
                 return -1;
             }
             continue;
         }
-        perror("Failed to connect to coordinator Unix socket");
+        perror("Failed to connect to coordinator TCP socket");
         cleanup_cross_validation();
         return -1;
     }
-    // Set back to blocking after connect
-    fcntl(g_validation_context->client_socket, F_SETFL, cflags & ~O_NONBLOCK);
     validation_message_t msg;
     memset(&msg, 0, sizeof(msg));
     msg.type = MSG_REGISTER_INSTANCE;
@@ -151,7 +169,7 @@ int init_cross_validation(int instance_id, int num_instances) {
         return -1;
     }
     g_validation_enabled = 1;
-    printf("✅ Instance %d connected to Unix socket-based cross-validation system\n", instance_id);
+    printf("✅ Instance %d connected to TCP-based cross-validation system\n", instance_id);
     fflush(stdout);
     return 0;
 }

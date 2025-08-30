@@ -33,11 +33,17 @@ cat input
 echo ""
 echo "🔌 Starting socket-based cross-validation with 2 instances..."
 
+sleep 2  # Give coordinator time to set up socket
+
+# Set TCP validation environment variables
+COORD_ADDR="10.200.205.81"
+COORD_PORT="5000"
+
 # Start coordinator instance (instance 0)
 echo "Starting instance 0 (coordinator)..."
 if [ "$MODE" = "mcmini" ]; then
-    # Run under McMini with coordinator port 7780
     CROSS_VALIDATION_INSTANCE_ID=0 CROSS_VALIDATION_NUM_INSTANCES=2 \
+    CROSS_VALIDATION_SERVER_ADDR=0.0.0.0 CROSS_VALIDATION_SERVER_PORT=$COORD_PORT \
     timeout --signal=SIGINT 60s /home/aayushi/tmp-mcmini/mcmini/dmtcp/build/mcmini \
         --coord-port 7780 \
         --ckptdir /tmp/mcmini_test1 \
@@ -45,18 +51,19 @@ if [ "$MODE" = "mcmini" ]; then
         --log-level 1 \
         ./WATER-NSQUARED < input &
 else
-    # Run normally
-    CROSS_VALIDATION_INSTANCE_ID=0 CROSS_VALIDATION_NUM_INSTANCES=2 timeout --signal=SIGINT 60s ./WATER-NSQUARED < input &
+    CROSS_VALIDATION_INSTANCE_ID=0 CROSS_VALIDATION_NUM_INSTANCES=2 \
+    CROSS_VALIDATION_SERVER_ADDR=0.0.0.0 CROSS_VALIDATION_SERVER_PORT=$COORD_PORT \
+    timeout --signal=SIGINT 60s ./WATER-NSQUARED < input &
 fi
 PID1=$!
 
-sleep 2  # Give coordinator time to set up socket
+sleep 2  # Give coordinator time to set up TCP socket
 
 # Start client instance (instance 1)
 echo "Starting instance 1 (client)..."
 if [ "$MODE" = "mcmini" ]; then
-    # Run under McMini with coordinator port 7781
     CROSS_VALIDATION_INSTANCE_ID=1 CROSS_VALIDATION_NUM_INSTANCES=2 \
+    CROSS_VALIDATION_SERVER_ADDR=$COORD_ADDR CROSS_VALIDATION_SERVER_PORT=$COORD_PORT \
     timeout --signal=SIGINT 60s /home/aayushi/tmp-mcmini/mcmini/dmtcp/build/mcmini \
         --coord-port 7781 \
         --ckptdir /tmp/mcmini_test2 \
@@ -64,8 +71,9 @@ if [ "$MODE" = "mcmini" ]; then
         --log-level 1 \
         ./WATER-NSQUARED < input &
 else
-    # Run normally
-    CROSS_VALIDATION_INSTANCE_ID=1 CROSS_VALIDATION_NUM_INSTANCES=2 timeout --signal=SIGINT 60s ./WATER-NSQUARED < input &
+    CROSS_VALIDATION_INSTANCE_ID=1 CROSS_VALIDATION_NUM_INSTANCES=2 \
+    CROSS_VALIDATION_SERVER_ADDR=$COORD_ADDR CROSS_VALIDATION_SERVER_PORT=$COORD_PORT \
+    timeout --signal=SIGINT 60s ./WATER-NSQUARED < input &
 fi
 PID2=$!
 
